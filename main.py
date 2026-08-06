@@ -1,13 +1,15 @@
-from fastapi import FastAPI, HTTPException
+import io
+import logging
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-import pandas as pd
-import numpy as np
-from typing import List
 from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-import logging
+from sklearn.preprocessing import StandardScaler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("datasight")
@@ -35,25 +37,55 @@ app.add_middleware(
 MIN_ROWS_FOR_MODEL = 3          # below this, a regression isn't meaningful
 MIN_ROWS_FOR_SEASONALITY = 14   # need ~2 weeks before trusting day-of-week patterns
 
+# Large-dataset guardrails (new)
+MAX_ROWS_PER_JSON_REQUEST = 300_000   # /analyze (JSON body) hard ceiling
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200MB cap for /analyze/upload
+MAX_ROWS_FOR_TRAINING = 50_000        # cap on rows actually fit into the regression
+
 
 # --- SCHEMAS ---
 class DataPoint(BaseModel):
     date: str
-    users: int
-    revenue: float
+    users: Optional[float] = None
+    revenue: Optional[float] = None
 
-    @field_validator("users")
+    @field_validator("users", "revenue", mode="before")
     @classmethod
-    def users_non_negative(cls, v):
-        if v < 0:
-            raise ValueError("users must be >= 0")
+    def _coerce_numeric(cls, v):
+        """
+        Real-world CSVs (especially big, hand-exported ones) are messy:
+        blank cells, "$1,200", stray whitespace, "N/A", etc. Previously
+        `users`/`revenue` were plain `int`/`float` fields, so ONE bad cell
+        anywhere in the payload raised a Pydantic ValidationError for the
+        WHOLE list and FastAPI returned a 422 for the entire request. That
+        is almost certainly why the dashboard failed on larger datasets
+        while small hand-typed ones worked (the terminal log even shows
+        "POST /analyze 422 Unprocessable Content"): bigger files simply
+        have a higher chance of containing one messy row.
+
+        Now we try to salvage the value here. If it truly can't be parsed
+        we return None, and the row is dropped later during cleaning
+        instead of failing the entire batch.
+        """
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.strip().replace(",", "").replace("$", "")
+            if v == "" or v.lower() in ("nan", "null", "none", "n/a", "-"):
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
         return v
 
-    @field_validator("revenue")
+    @field_validator("users", "revenue")
     @classmethod
-    def revenue_non_negative(cls, v):
-        if v < 0:
-            raise ValueError("revenue must be >= 0")
+    def _drop_negative(cls, v):
+        # Negative users/revenue is bad data, not a reason to fail the
+        # whole upload -- treat it as missing instead of raising.
+        if v is not None and v < 0:
+            return None
         return v
 
 
@@ -96,50 +128,69 @@ def _build_features(df: pd.DataFrame):
     return df, feature_cols
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
-def analyze_data(payload: List[DataPoint]):
-    # 0. Guard against empty / insufficient payloads
-    if not payload:
-        raise HTTPException(status_code=400, detail="Payload cannot be empty.")
-    if len(payload) < MIN_ROWS_FOR_MODEL:
-        raise HTTPException(
-            status_code=400,
-            detail=f"At least {MIN_ROWS_FOR_MODEL} data points are required to build a model."
-        )
+def _clean_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """
+    Shared cleaning path for BOTH ingestion routes (JSON list and CSV
+    upload). Coerces types and drops unusable rows instead of throwing
+    the whole request away, which is the key change that lets large,
+    real-world (i.e. imperfect) datasets get through at all.
+    """
+    starting_rows = len(df)
 
-    # 1. Convert JSON payload to DataFrame (pydantic's own serializer, not vars())
-    try:
-        df = pd.DataFrame([p.model_dump() for p in payload])
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse payload: {str(e)}")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["users"] = pd.to_numeric(df["users"], errors="coerce")
+    df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce")
 
-    if df[["users", "revenue"]].isnull().any().any():
-        raise HTTPException(status_code=400, detail="Payload contains null users/revenue values.")
-
-    # 2. Parse and sort by date; drop duplicate dates (keep the latest entry)
-    try:
-        df["date"] = pd.to_datetime(df["date"])
-    except Exception:
-        raise HTTPException(status_code=400, detail="One or more 'date' values could not be parsed.")
-
+    df = df.dropna(subset=["date", "users", "revenue"])
     df = df.drop_duplicates(subset="date", keep="last")
     df = df.sort_values("date").reset_index(drop=True)
+
+    dropped_rows = starting_rows - len(df)
+    return df, dropped_rows
+
+
+def _analyze_dataframe(df: pd.DataFrame) -> dict:
+    """
+    Everything downstream of "I have a raw date/users/revenue dataframe" --
+    cleaning, metrics, feature engineering, model fit, and prediction.
+    Both /analyze and /analyze/upload funnel into this so behaviour stays
+    identical no matter how the data arrived.
+    """
+    df, dropped_rows = _clean_dataframe(df)
 
     if len(df) < MIN_ROWS_FOR_MODEL:
         raise HTTPException(
             status_code=400,
-            detail="Not enough unique dated rows remain after removing duplicates to build a model."
+            detail=(
+                f"Only {len(df)} usable row(s) remained after cleaning "
+                f"({dropped_rows} row(s) were dropped for bad/missing date, "
+                f"users, or revenue values). At least {MIN_ROWS_FOR_MODEL} "
+                "valid rows are required to build a model."
+            ),
         )
 
-    # 3. Historical metrics
+    # 3. Historical metrics -- always computed on the FULL cleaned dataset,
+    # never on a sample, so totals/averages stay exact no matter how large
+    # the input is.
     total_revenue = float(df["revenue"].sum())
     avg_users = float(df["users"].mean())
 
     # --- MACHINE LEARNING ENGINE ---
+    # For very large datasets, fit the model on an evenly-spaced sample
+    # instead of every single row. This keeps request latency bounded
+    # (Ridge/StandardScaler are fast, but there's no reason to fit on
+    # millions of rows when a representative subset gives the same fit).
+    # Aggregates above and the "next row" features below still use the
+    # FULL dataset, so the prediction remains as accurate as possible.
+    model_source_df = df
+    if len(df) > MAX_ROWS_FOR_TRAINING:
+        step = max(len(df) // MAX_ROWS_FOR_TRAINING, 1)
+        model_source_df = df.iloc[::step].reset_index(drop=True)
+
     # 4. Feature engineering
-    df, feature_cols = _build_features(df)
-    X = df[feature_cols].values
-    y = df["revenue"].values
+    model_df, feature_cols = _build_features(model_source_df)
+    X = model_df[feature_cols].values
+    y = model_df["revenue"].values
 
     # 5. Train a scaled Ridge regression (more stable than plain OLS on small/noisy data)
     try:
@@ -156,7 +207,9 @@ def analyze_data(payload: List[DataPoint]):
         logger.exception("Model fitting failed")
         raise HTTPException(status_code=500, detail=f"Model fitting failed: {str(e)}")
 
-    # 6. Build the feature row for "tomorrow" and predict
+    # 6. Build the feature row for "tomorrow" and predict.
+    # day_index and rolling_avg_3/date use the FULL dataframe (df), not the
+    # (possibly sampled) model_df, so the extrapolation point stays accurate.
     next_row = {
         "day_index": len(df),
         "users": avg_users,
@@ -188,8 +241,17 @@ def analyze_data(payload: List[DataPoint]):
     else:
         confidence = "low"
 
+    message = "Data successfully processed and modeled."
+    if dropped_rows:
+        message += f" ({dropped_rows} row(s) were skipped for invalid/missing values.)"
+    if len(df) > MAX_ROWS_FOR_TRAINING:
+        message += (
+            f" Model was trained on a {len(model_df)}-row sample of the "
+            f"{len(df)}-row dataset for speed; totals/averages use all rows."
+        )
+
     return {
-        "message": "Data successfully processed and modeled.",
+        "message": message,
         "total_rows_ingested": len(df),
         "computed_total_revenue": total_revenue,
         "computed_average_users": avg_users,
@@ -200,3 +262,83 @@ def analyze_data(payload: List[DataPoint]):
         "model_confidence": confidence,
         "features_used": feature_cols,
     }
+
+
+@app.post("/analyze", response_model=AnalysisResponse)
+def analyze_data(payload: List[DataPoint]):
+    # 0. Guard against empty / insufficient / oversized payloads
+    if not payload:
+        raise HTTPException(status_code=400, detail="Payload cannot be empty.")
+    if len(payload) < MIN_ROWS_FOR_MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At least {MIN_ROWS_FOR_MODEL} data points are required to build a model."
+        )
+    if len(payload) > MAX_ROWS_PER_JSON_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Payload has {len(payload)} rows, which exceeds the "
+                f"{MAX_ROWS_PER_JSON_REQUEST}-row limit for JSON requests. "
+                "For bigger files, POST the raw CSV to /analyze/upload instead "
+                "-- it skips JSON serialization entirely and handles much "
+                "larger datasets."
+            ),
+        )
+
+    # 1. Convert to a DataFrame. Pulling each field into its own list is
+    # noticeably faster than building a dict per row (model_dump()) once
+    # you're dealing with tens/hundreds of thousands of rows.
+    try:
+        df = pd.DataFrame({
+            "date": [p.date for p in payload],
+            "users": [p.users for p in payload],
+            "revenue": [p.revenue for p in payload],
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse payload: {str(e)}")
+
+    return _analyze_dataframe(df)
+
+
+@app.post("/analyze/upload", response_model=AnalysisResponse)
+async def analyze_uploaded_csv(file: UploadFile = File(...)):
+    """
+    New endpoint, purpose-built for large datasets.
+
+    Sending a big JSON array of objects (as /analyze does) means the browser
+    has to build + stringify one JS object per row and the backend has to
+    validate one Pydantic model per row. That overhead scales badly. Letting
+    the frontend upload the raw CSV file instead -- and parsing it directly
+    with pandas -- is dramatically cheaper for large files and is the
+    recommended path once a dataset gets past a few tens of thousands of rows.
+    """
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit."
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {str(e)}")
+
+    df.columns = df.columns.str.strip().str.lower()
+    required_cols = {"date", "users", "revenue"}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required column(s): {', '.join(sorted(missing_cols))}"
+        )
+
+    df = df[["date", "users", "revenue"]]
+
+    return _analyze_dataframe(df)
