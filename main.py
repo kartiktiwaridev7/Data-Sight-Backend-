@@ -108,10 +108,25 @@ def read_root():
     return {"status": "System Online", "message": "DataSight Backend is active."}
 
 
-def _build_features(df: pd.DataFrame):
-    """Engineer features, adapting to how much data is actually available."""
+def _build_features(df: pd.DataFrame, anchor_date=None):
+    """
+    Engineer features, adapting to how much data is actually available.
+
+    `day_index` used to be `range(len(df))` -- a plain row counter. That
+    breaks the moment there's a gap in the dates (a skipped weekend, a
+    missed logging day, etc.), because two rows that are 3 calendar days
+    apart end up only 1 index apart. The regression then reads that gap as
+    a steep single-day jump in revenue and learns an inflated growth slope,
+    which makes "tomorrow" predictions overshoot.
+
+    Fix: `day_index` is now the actual number of calendar days since an
+    anchor date, so a 3-day gap contributes a day_index difference of 3,
+    not 1, and the learned slope reflects real elapsed time.
+    """
     df = df.copy()
-    df["day_index"] = range(len(df))
+    if anchor_date is None:
+        anchor_date = df["date"].min()
+    df["day_index"] = (df["date"] - anchor_date).dt.days
     feature_cols = ["day_index", "users"]
 
     # Only trust day-of-week seasonality once there's enough history
@@ -187,8 +202,13 @@ def _analyze_dataframe(df: pd.DataFrame) -> dict:
         step = max(len(df) // MAX_ROWS_FOR_TRAINING, 1)
         model_source_df = df.iloc[::step].reset_index(drop=True)
 
-    # 4. Feature engineering
-    model_df, feature_cols = _build_features(model_source_df)
+    # 4. Feature engineering. The anchor date is fixed to the FULL
+    # dataset's earliest date (not the sampled subset's), so day_index
+    # means the same thing whether or not sampling kicked in above, and
+    # the next-day prediction row lines up with what the model was
+    # trained on.
+    anchor_date = df["date"].min()
+    model_df, feature_cols = _build_features(model_source_df, anchor_date=anchor_date)
     X = model_df[feature_cols].values
     y = model_df["revenue"].values
 
@@ -208,15 +228,20 @@ def _analyze_dataframe(df: pd.DataFrame) -> dict:
         raise HTTPException(status_code=500, detail=f"Model fitting failed: {str(e)}")
 
     # 6. Build the feature row for "tomorrow" and predict.
-    # day_index and rolling_avg_3/date use the FULL dataframe (df), not the
-    # (possibly sampled) model_df, so the extrapolation point stays accurate.
+    # rolling_avg_3/date use the FULL dataframe (df), not the (possibly
+    # sampled) model_df, so the extrapolation point stays accurate.
+    # "Tomorrow" is always the calendar day after the last observed date,
+    # even if that date itself followed a gap -- day_index is measured
+    # from the same anchor_date the model was trained against, so the
+    # step from the last training row to this one is the true number of
+    # elapsed days, not an artificial "+1 row".
+    next_date = df["date"].iloc[-1] + pd.Timedelta(days=1)
     next_row = {
-        "day_index": len(df),
+        "day_index": (next_date - anchor_date).days,
         "users": avg_users,
         "rolling_avg_3": float(df["revenue"].tail(3).mean()),
     }
     if "dow_sin" in feature_cols:
-        next_date = df["date"].iloc[-1] + pd.Timedelta(days=1)
         next_dow = next_date.dayofweek
         next_row["dow_sin"] = np.sin(2 * np.pi * next_dow / 7)
         next_row["dow_cos"] = np.cos(2 * np.pi * next_dow / 7)
