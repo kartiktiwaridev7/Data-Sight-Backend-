@@ -126,7 +126,14 @@ def _clean_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
     for col in ("users", "revenue"):
-        if df[col].dtype == object:
+        # NOTE: don't check `df[col].dtype == object` here -- pandas 2.x
+        # gives string columns `object` dtype, but pandas 3.x defaults to a
+        # separate `str` dtype, so that check silently stops matching and
+        # currency formatting like "$1,200" never gets stripped, quietly
+        # dropping every such row later. `is_numeric_dtype` is dtype-version
+        # agnostic: if it's not already numeric, run it through the same
+        # string cleanup regardless of which "string" dtype pandas used.
+        if not pd.api.types.is_numeric_dtype(df[col]):
             df[col] = (
                 df[col]
                 .astype(str)
@@ -283,19 +290,87 @@ def analyze_data(payload: List[DataPoint]):
     return _analyze_dataframe(df)
 
 
+def _find_column(df: pd.DataFrame, cols_lower: dict, candidates: List[str]) -> Optional[str]:
+    """Return the first column whose lowercased name contains any of the
+    given substrings, checked in priority order (earlier candidates win)."""
+    for key in candidates:
+        match = next((c for c in df.columns if key in cols_lower[c]), None)
+        if match:
+            return match
+    return None
+
+
+def _resolve_schema(df: pd.DataFrame) -> Tuple[pd.Series, Optional[str], Optional[str]]:
+    """
+    Figure out how to get a date, a users-like column, and a revenue-like
+    column out of an arbitrary uploaded file.
+
+    Real-world exports rarely use the literal words "date"/"users"/
+    "revenue" -- they use things like `year` + `month`, `gross_revenue_usd`,
+    `estimated_active_players`, etc. This resolves those cases instead of
+    requiring an exact schema match.
+    """
+    cols_lower = {c: c.lower() for c in df.columns}
+
+    # ---- date: literal column, else synthesize from year(+month, +day) ----
+    date_col = _find_column(df, cols_lower, ["date"])
+    if date_col:
+        date_series = pd.to_datetime(df[date_col], errors="coerce")
+    else:
+        year_col = next((c for c in df.columns if cols_lower[c] in ("year", "yr", "fiscal_year")), None)
+        month_col = next((c for c in df.columns if cols_lower[c] in ("month", "mon", "mo")), None)
+        day_col = next((c for c in df.columns if cols_lower[c] in ("day", "dom")), None)
+        if year_col and month_col:
+            date_series = pd.to_datetime(
+                {
+                    "year": pd.to_numeric(df[year_col], errors="coerce"),
+                    "month": pd.to_numeric(df[month_col], errors="coerce"),
+                    "day": pd.to_numeric(df[day_col], errors="coerce") if day_col else 1,
+                },
+                errors="coerce",
+            )
+        elif year_col:
+            # Year-only granularity: anchor every row to Jan 1st of that year.
+            date_series = pd.to_datetime(
+                pd.to_numeric(df[year_col], errors="coerce"), format="%Y", errors="coerce"
+            )
+        else:
+            date_series = pd.Series([pd.NaT] * len(df))
+
+    # ---- revenue: prefer an unambiguous "total/gross" revenue field over
+    # narrower sub-revenue streams (dlc, add-on, etc.) ----
+    revenue_col = _find_column(
+        df, cols_lower, ["gross_revenue", "total_revenue", "net_revenue", "revenue", "gross_sales", "sales_usd"]
+    )
+
+    # ---- users: prefer an explicit active/unique-user metric over raw
+    # transaction counts ----
+    users_col = _find_column(
+        df,
+        cols_lower,
+        ["active_player", "active_user", "dau", "mau", "unique_user", "users", "player", "customer"],
+    )
+
+    return date_series, revenue_col, users_col
+
+
 @app.post("/analyze/upload", response_model=AnalysisResponse)
 async def analyze_uploaded_csv(file: UploadFile = File(...)):
     """
-    IMPORTANT: this now delegates to the exact same `_analyze_dataframe`
-    pipeline as /analyze, instead of running its own separate (and
-    time-blind) regression. That old separate path fit Ridge on whatever
-    numeric columns happened to exist, never looked at the date column,
-    and returned a completely different set of field names
-    (model_score/confidence/expected_range_min/max) than the frontend
-    expects (predicted_next_day_revenue/model_r2/model_confidence/etc.) --
-    which is why the dashboard showed blank "$" values and a raw
-    "mlData.confidence?.toUpperCase()" string. Routing through the shared
-    pipeline fixes both problems at once.
+    Delegates to the same `_analyze_dataframe` pipeline as /analyze, so the
+    response shape is always identical no matter how the data arrived.
+
+    Column handling has two tiers:
+      1. Exact schema match (columns literally named date/users/revenue,
+         one row per period) -- used as-is.
+      2. Smart resolution -- date synthesized from year/month/day if no
+         date column exists, revenue/users matched against a priority list
+         of common real-world names, and (because files matched this way
+         are almost always broken out by category -- country, platform,
+         etc. -- with several rows per period) the rows are grouped and
+         summed per date before modeling, instead of the exact-match path's
+         "drop duplicate dates" behaviour, which would silently discard
+         nearly the whole file.
     """
     contents = await file.read()
 
@@ -321,33 +396,75 @@ async def analyze_uploaded_csv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse file: {str(e)}")
 
-    # Match whatever the file's columns are named (Date/DATE/date, Users/user_count, etc.)
-    # to the date/users/revenue schema the model needs, instead of assuming
-    # exact lowercase names or grabbing arbitrary numeric columns.
-    df.columns = [str(c).strip() for c in df.columns]
-    col_map = {}
-    for col in df.columns:
-        lc = col.lower()
-        if "date" in lc and "date" not in col_map.values():
-            col_map[col] = "date"
-        elif "revenue" in lc and "revenue" not in col_map.values():
-            col_map[col] = "revenue"
-        elif "user" in lc and "users" not in col_map.values():
-            col_map[col] = "users"
-    df = df.rename(columns=col_map)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="The uploaded file has no rows.")
 
-    missing = [c for c in ("date", "users", "revenue") if c not in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
+    cols_lower = {c: c.lower() for c in df.columns}
+
+    # Tier 1: exact date/users/revenue columns present -- use the original,
+    # stricter path (no forced aggregation).
+    exact = {}
+    for target in ("date", "users", "revenue"):
+        match = next((c for c in df.columns if cols_lower[c] == target), None)
+        if match:
+            exact[target] = match
+
+    if len(exact) == 3:
+        clean_df = df.rename(columns={v: k for k, v in exact.items()})[["date", "users", "revenue"]]
+        if len(clean_df) > MAX_ROWS_PER_JSON_REQUEST:
+            clean_df = clean_df.iloc[:MAX_ROWS_PER_JSON_REQUEST].copy()
+        return _analyze_dataframe(clean_df)
+
+    # Tier 2: smart resolution + aggregation for real-world exports that
+    # don't use the exact column names, and/or have multiple rows per period.
+    date_series, revenue_col, users_col = _resolve_schema(df)
+
+    missing = []
+    if date_series.isna().all():
+        missing.append("date (or year/month)")
+    if revenue_col is None:
+        missing.append("revenue")
+    if users_col is None:
+        missing.append("users")
+
     if missing:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Couldn't find a column for: {', '.join(missing)}. "
-                "The file needs columns that look like a date, a user count, "
-                "and a revenue figure (matched by name, e.g. 'Date', 'Users', 'Revenue')."
+                f"Couldn't find a usable column for: {', '.join(missing)}. "
+                "The file needs a date (or year/month) column, a revenue-like "
+                "column (e.g. 'revenue', 'gross_revenue_usd'), and a user/player "
+                "count column (e.g. 'users', 'active_players', 'customers'). "
+                f"Columns found in this file: {', '.join(df.columns)}"
             ),
         )
 
-    if len(df) > MAX_ROWS_PER_JSON_REQUEST:
-        df = df.iloc[:MAX_ROWS_PER_JSON_REQUEST].copy()
+    work = pd.DataFrame({
+        "date": date_series,
+        "users": pd.to_numeric(df[users_col], errors="coerce"),
+        "revenue": pd.to_numeric(df[revenue_col], errors="coerce"),
+    }).dropna(subset=["date", "users", "revenue"])
 
-    return _analyze_dataframe(df[["date", "users", "revenue"]])
+    if work.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No rows had usable values in all of the date, users, and revenue columns after cleaning.",
+        )
+
+    # Collapse multiple rows per period (e.g. one row per country per month)
+    # into a single global total per date -- the model expects one row per
+    # time period, not one row per (period, category) combination.
+    agg_df = work.groupby("date", as_index=False).agg(users=("users", "sum"), revenue=("revenue", "sum"))
+    agg_df = agg_df.sort_values("date").reset_index(drop=True)
+
+    if len(agg_df) > MAX_ROWS_PER_JSON_REQUEST:
+        agg_df = agg_df.iloc[:MAX_ROWS_PER_JSON_REQUEST].copy()
+
+    result = _analyze_dataframe(agg_df)
+    result["message"] += (
+        f" (Detected columns: date from '{exact.get('date', 'year/month')}', "
+        f"revenue from '{revenue_col}', users from '{users_col}'; "
+        f"{len(df)} input rows were grouped into {len(agg_df)} time periods.)"
+    )
+    return result
