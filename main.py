@@ -21,14 +21,14 @@ app = FastAPI(title="DataSight API Engine")
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",   # Vite dev server default port
-    "https://yourfrontend.com",
+    "https://datasight.netlify.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
