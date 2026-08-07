@@ -39,6 +39,7 @@ MIN_ROWS_FOR_SEASONALITY = 14   # need ~2 weeks before trusting day-of-week patt
 MAX_ROWS_PER_JSON_REQUEST = 300_000   # /analyze (JSON body) hard ceiling
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200MB cap for /analyze/upload
 MAX_ROWS_FOR_TRAINING = 50_000        # cap on rows actually fit into the regression
+MAX_CHART_POINTS = 500                # cap on points sent back for the frontend chart
 
 
 # --- SCHEMAS ---
@@ -70,6 +71,12 @@ class DataPoint(BaseModel):
         return v
 
 
+class HistoricalPoint(BaseModel):
+    date: str
+    revenue: float
+    users: float
+
+
 class AnalysisResponse(BaseModel):
     message: str
     total_rows_ingested: int
@@ -81,6 +88,7 @@ class AnalysisResponse(BaseModel):
     model_r2: float
     model_confidence: str
     features_used: List[str]
+    historical_series: List[HistoricalPoint]
 
 
 # --- ROUTES ---
@@ -245,6 +253,24 @@ def _analyze_dataframe(df: pd.DataFrame) -> dict:
             f"{len(df)}-row dataset for speed; totals/averages use all rows."
         )
 
+    # Build the series the frontend actually charts. This is the SAME
+    # cleaned/aggregated dataframe the model was built from -- not a
+    # re-parse of the raw upload -- so a file like a per-country monthly
+    # sales log (no literal "date"/"revenue" columns, many rows per period)
+    # charts correctly instead of plotting blank/undefined points.
+    chart_df = df
+    if len(chart_df) > MAX_CHART_POINTS:
+        step = max(len(chart_df) // MAX_CHART_POINTS, 1)
+        chart_df = chart_df.iloc[::step]
+    historical_series = [
+        {
+            "date": row.date.strftime("%Y-%m-%d"),
+            "revenue": round(float(row.revenue), 2),
+            "users": round(float(row.users), 2),
+        }
+        for row in chart_df.itertuples()
+    ]
+
     return {
         "message": message,
         "total_rows_ingested": len(df),
@@ -256,6 +282,7 @@ def _analyze_dataframe(df: pd.DataFrame) -> dict:
         "model_r2": round(r2, 3),
         "model_confidence": confidence,
         "features_used": feature_cols,
+        "historical_series": historical_series,
     }
 
 
